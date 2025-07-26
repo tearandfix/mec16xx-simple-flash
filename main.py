@@ -20,7 +20,9 @@ from OpenOCD import OpenOCD
 oocd = OpenOCD()
 oocd.Halt()
 
-FIRMWARE_SIZE = 0x30_000
+FIRMWARE_SIZE = 0x40_000        # for MEC1663
+#FIRMWARE_SIZE = 0x30_000       # for MEC1633
+EEPROM_SIZE = 2048
 
 Flash_Config = bitstruct.bitstruct("Flash_Config", 32, [
     ("Reg_Ctl_En",      1),
@@ -75,6 +77,41 @@ Flash_Command_addr  = Flash_base_addr + 0x108
 Flash_Status_addr   = Flash_base_addr + 0x10c
 Flash_Config_addr   = Flash_base_addr + 0x110
 Flash_Init_addr     = Flash_base_addr + 0x114
+
+
+EEPROM_base_addr    = 0xf0_2c00
+
+EEPROM_Data_addr = EEPROM_base_addr + 0x00
+EEPROM_Address_addr = EEPROM_base_addr + 0x04
+EEPROM_Command_addr = EEPROM_base_addr + 0x08
+EEPROM_Status_addr = EEPROM_base_addr + 0x0c
+EEPROM_Configuration_addr = EEPROM_base_addr + 0x10
+EEPROM_Unlock_addr = EEPROM_base_addr + 0x20
+
+EEPROM_Command = bitstruct.bitstruct("EEPROM_Command", 32, [
+    ("EEPROM_Mode", 2),
+    ("Burst",       1),
+    (None,         29),
+])
+
+EEPROM_Status = bitstruct.bitstruct("EEPROM_Status", 32, [
+    ("Busy",            1),
+    ("Data_Full",       1),
+    ("Address_Full",    1),
+    (None,              4),
+    ("EEPROM_Block",    1),
+    ("Busy_Err",        1),
+    ("CMD_Err",         1),
+    (None,             22),
+])
+
+EEPROM_Mode_Standby  = 0
+EEPROM_Mode_Read     = 1
+EEPROM_Mode_Program  = 2
+EEPROM_Mode_Erase    = 3
+
+class MEC16xxError(Exception):
+    pass
 
 def read_reg(addr, space):
     log.info(f'reading from {hex(addr)}')
@@ -176,11 +213,105 @@ def erase_flash(address=0b11111 << 19):
     send_flash_command(mode=Flash_Mode_Erase, address=address)
 
 def program_flash(address, words):
-    send_flash_command(mode=Flash_Mode_Program, address=address, burst=1)
+    send_flash_command(mode=Flash_Mode_Program, address=address, burst=True)
 
     for offset, data in enumerate(words):
         write_reg(Flash_Data_addr, data, space="memory")
         log.debug("program Flash_Address=%05x Flash_Data=%08x", address + offset * 4, data)
+
+def is_eeprom_blocked():
+    eeprom_status = EEPROM_Status.from_int(read_reg(EEPROM_Status_addr, space="memory"))
+    return eeprom_status.EEPROM_Block
+
+def eeprom_clean_start():
+    if is_eeprom_blocked():
+        raise MEC16xxError(f"Error: EEPROM is blocked, no EEPROM operations are possible.")
+    eeprom_command = EEPROM_Command(EEPROM_Mode=EEPROM_Mode_Standby)
+    log.debug("write EEPROM_Command %s", eeprom_command.bits_repr(omit_zero=True))
+    write_reg(EEPROM_Command_addr, eeprom_command.to_int(), space="memory")
+
+    # Clear EEPROM controller error status.
+    eeprom_clear_status = EEPROM_Status(Busy_Err=1, CMD_Err=1)
+    log.debug("clear EEPROM_Status %s", eeprom_clear_status.bits_repr(omit_zero=True))
+    write_reg(EEPROM_Status_addr, eeprom_clear_status.to_int(), space="memory")
+
+def eeprom_wait_for_not_busy(fail_msg="Failure detected"):
+    eeprom_status = EEPROM_Status(Busy=1)
+    while eeprom_status.Busy:
+        eeprom_status = EEPROM_Status.from_int(read_reg(EEPROM_Status_addr, space="memory"))
+        log.debug("read EEPROM_Status %s", eeprom_status.bits_repr(omit_zero=True))
+
+        if eeprom_status.Busy_Err or eeprom_status.CMD_Err:
+            raise MEC16xxError("%s with status %s"
+                                % (fail_msg,
+                                    eeprom_status.bits_repr(omit_zero=True)))
+    
+def eeprom_command(mode, address=0, burst=False):
+    eeprom_command = EEPROM_Command(EEPROM_Mode=mode, Burst=burst)
+    log.debug("write EEPROM_Command %s", eeprom_command.bits_repr(omit_zero=True))
+    write_reg(EEPROM_Command_addr, eeprom_command.to_int(), space="memory")
+
+    if mode != EEPROM_Mode_Standby:
+        log.debug("write EEPROM_Address=%08x", address)
+        write_reg(EEPROM_Address_addr, address, space="memory")
+
+    eeprom_wait_for_not_busy(f"EEPROM command {eeprom_command.bits_repr(omit_zero=True)} failed")
+
+def read_eeprom(address=0, count=EEPROM_SIZE):
+    """Read all of the embedded 2KiB eeprom.
+
+    Arguments:
+    address -- byte address of first eeprom address
+    count -- number of bytes to read
+    """
+    eeprom_clean_start()
+    eeprom_command(EEPROM_Mode_Read, address = address, burst=True)
+    bytes = []
+    for offset in range(count):
+        data = read_reg(EEPROM_Data_addr, space="memory")
+        log.debug("read address=%05x EEPROM_Data=%08x",
+                    address + offset, data)
+        bytes.append(data)
+    eeprom_command(mode=EEPROM_Mode_Standby)
+    return bytes
+
+def erase_eeprom(address=0b11111 << 11):
+    """Erase all or part of the embedded 2KiB eeprom.
+
+    Arguments:
+    address -- The default value of 0b11111 << 11 is a magic number that erases
+                the entire EEPROM. Otherwise one can specify the byte address of
+                a 8-byte page. The lower 3 bits must always be zero.
+    """
+    eeprom_clean_start()
+    eeprom_command(mode=EEPROM_Mode_Erase, address=address)
+    eeprom_command(mode=EEPROM_Mode_Standby)
+
+def eeprom_wait_for_data_not_full(fail_msg="Failure detected"):
+    eeprom_status = EEPROM_Status(Data_Full=1)
+    while eeprom_status.Data_Full:
+        eeprom_status = EEPROM_Status.from_int(
+            read_reg(EEPROM_Status_addr, space="memory"))
+        log.debug("read EEPROM_Status %s", eeprom_status.bits_repr(omit_zero=True))
+
+        if eeprom_status.Busy_Err or eeprom_status.CMD_Err:
+            raise MEC16xxError("%s with status %s"
+                                % (fail_msg,
+                                    eeprom_status.bits_repr(omit_zero=True)))
+
+def program_eeprom(address, bytes):
+    """ Program eeprom.
+
+    Assumes that the area has already been erased.
+    """
+    eeprom_clean_start()
+    eeprom_command(mode=EEPROM_Mode_Program, address=address, burst=True)
+    for offset, data in enumerate(bytes):
+        eeprom_wait_for_data_not_full()
+        write_reg(EEPROM_Data_addr, data, space="memory")
+        log.debug("program EEPROM_Address=%05x EEPROM_Data=%08x", address + offset * 4, data)
+    eeprom_wait_for_not_busy()
+    eeprom_command(mode=EEPROM_Mode_Standby)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -188,6 +319,9 @@ def parse_args():
     parser.add_argument('--read', action='store_true')
     parser.add_argument('--write', action='store_true')
     parser.add_argument('--erase', action='store_true')
+    parser.add_argument('--read-eeprom', action='store_true')
+    parser.add_argument('--write-eeprom', action='store_true')
+    parser.add_argument('--erase-eeprom', action='store_true')
 
     return parser.parse_args()
 
@@ -203,8 +337,20 @@ def main():
         with open(args.filename, 'wb') as file:
             for word in words:
                 file.write(struct.pack("<L", word))
-
-    if args.write:
+    elif args.read_eeprom:
+        data = bytes(read_eeprom(0))
+        with open(args.filename, 'wb') as file:
+            file.write(data)
+    elif args.erase_eeprom:
+        erase_eeprom()
+    elif args.write_eeprom:
+        with open(args.filename, 'rb') as file:
+            data = file.read()
+            if len(data) != EEPROM_SIZE:
+                raise MEC16xxError(f"Error: given eeprom file size ({len(data)} bytes) is different from the physical EEPROM size ({EEPROM_SIZE} bytes)")
+            erase_eeprom()
+            program_eeprom(0, data)
+    elif args.write:
         words = []
 
         with open(args.filename, 'rb') as file:
@@ -213,7 +359,7 @@ def main():
                 words.append(word)
 
         enable_flash_access(enabled=True)
-        # erase_flash()
+        #erase_flash()
         program_flash(0, words)
         enable_flash_access(enabled=False)
 
